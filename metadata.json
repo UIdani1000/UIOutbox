@@ -1,0 +1,8 @@
+{
+  "name": "6th UIOutbox",
+  "description": "Private outbound-sales CRM and automation platform for UI Dani (UIDani).",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

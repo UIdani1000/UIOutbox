@@ -1,0 +1,209 @@
+// =============================================================================
+// Groq AI Provider (OpenAI-Compatible High-Speed Inference)
+// Ultra-fast LLM execution with native JSON mode and intelligent error mapping
+// =============================================================================
+
+import OpenAI from 'openai';
+import { IAIProvider, ProviderErrorClassification, ProviderExecutionResult } from './baseProvider';
+import { AIProviderName, AIRequest } from '../types';
+
+export class GroqProvider implements IAIProvider {
+  public readonly name: AIProviderName = 'groq';
+  public readonly displayName = 'Groq';
+
+  private client: OpenAI | null = null;
+
+  public isConfigured(): boolean {
+    const key = process.env.GROQ_API_KEY;
+    return typeof key === 'string' && key.trim().length > 0;
+  }
+
+  private getClient(): OpenAI {
+    if (!this.client) {
+      const key = process.env.GROQ_API_KEY;
+      if (!key) {
+        throw new Error('GROQ_API_KEY environment variable is not configured.');
+      }
+      this.client = new OpenAI({
+        apiKey: key.trim(),
+        baseURL: 'https://api.groq.com/openai/v1',
+      });
+    }
+    return this.client;
+  }
+
+  public getConfiguredModel(): string {
+    return (process.env.GROQ_MODEL || 'llama-3.3-70b-versatile').trim();
+  }
+
+  public classifyError(error: any): ProviderErrorClassification {
+    const errMsg = String(error?.message || error || '');
+    const status = error?.status || error?.statusCode || (error?.error && error.error.status);
+
+    // 1. 429 Rate Limit / TPM / RPM / Quota Exhausted
+    if (
+      status === 429 ||
+      errMsg.includes('429') ||
+      errMsg.includes('rate_limit_exceeded') ||
+      errMsg.includes('Rate limit reached') ||
+      errMsg.includes('quota') ||
+      errMsg.includes('tokens per minute') ||
+      errMsg.includes('requests per minute') ||
+      errMsg.includes('daily limit')
+    ) {
+      let retrySec = 60; // 60s cooldown for Groq rate limits
+      const retryMatch = errMsg.match(/retry after (\d+)/i) || errMsg.match(/(\d+)s/);
+      if (retryMatch && retryMatch[1]) {
+        const parsed = parseInt(retryMatch[1], 10);
+        if (!isNaN(parsed) && parsed > 0 && parsed <= 3600) {
+          retrySec = parsed;
+        }
+      }
+
+      return {
+        category: 'RATE_LIMITED',
+        isRetryable: false, // Failover immediately to prevent blocking
+        statusCode: 429,
+        message: errMsg,
+        retryAfterSeconds: retrySec,
+      };
+    }
+
+    // 2. 401 / 403 Authentication Error
+    if (
+      status === 401 ||
+      status === 403 ||
+      errMsg.includes('invalid_api_key') ||
+      errMsg.includes('Incorrect API key') ||
+      errMsg.includes('AuthenticationError') ||
+      errMsg.includes('Unauthorized')
+    ) {
+      return {
+        category: 'AUTH_FAILED',
+        isRetryable: false,
+        statusCode: status || 401,
+        message: errMsg,
+      };
+    }
+
+    // 3. 404 Model Not Found / Decommissioned
+    if (
+      status === 404 ||
+      errMsg.includes('model_not_found') ||
+      errMsg.includes('does not exist') ||
+      errMsg.includes('decommissioned')
+    ) {
+      return {
+        category: 'MODEL_NOT_FOUND',
+        isRetryable: false,
+        statusCode: 404,
+        message: errMsg,
+      };
+    }
+
+    // 4. 400 Bad Request / Invalid Parameters
+    if (status === 400 || errMsg.includes('invalid_request_error') || errMsg.includes('bad_request')) {
+      return {
+        category: 'INVALID_REQUEST',
+        isRetryable: false,
+        statusCode: 400,
+        message: errMsg,
+      };
+    }
+
+    // 5. Network / Timeout / Socket Hangup
+    if (
+      status === 408 ||
+      errMsg.includes('fetch failed') ||
+      errMsg.includes('ECONNRESET') ||
+      errMsg.includes('ETIMEDOUT') ||
+      errMsg.includes('socket hang up') ||
+      errMsg.includes('timeout')
+    ) {
+      return {
+        category: 'NETWORK_ERROR',
+        isRetryable: true,
+        statusCode: status || 500,
+        message: errMsg,
+      };
+    }
+
+    // 6. 500 / 502 / 503 / 504 Server Error
+    if (
+      status >= 500 ||
+      errMsg.includes('server_error') ||
+      errMsg.includes('service_unavailable') ||
+      errMsg.includes('503') ||
+      errMsg.includes('502')
+    ) {
+      return {
+        category: 'SERVER_ERROR',
+        isRetryable: true,
+        statusCode: status || 500,
+        message: errMsg,
+      };
+    }
+
+    return {
+      category: 'UNKNOWN',
+      isRetryable: false,
+      statusCode: status || 500,
+      message: errMsg,
+    };
+  }
+
+  public async execute(request: AIRequest): Promise<ProviderExecutionResult> {
+    const groq = this.getClient();
+    const model = request.preferredModel || this.getConfiguredModel();
+
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
+
+    let systemPrompt = request.systemPrompt || '';
+    if (request.expectedOutput !== 'text' && !systemPrompt.includes('JSON')) {
+      systemPrompt = `${systemPrompt}\nIMPORTANT: Respond ONLY with valid, RFC 8259 compliant JSON. No markdown codeblocks, no explanations.`.trim();
+    }
+
+    if (systemPrompt) {
+      messages.push({
+        role: 'system',
+        content: systemPrompt,
+      });
+    }
+
+    messages.push({
+      role: 'user',
+      content: request.userPrompt,
+    });
+
+    const isJsonExpected = request.expectedOutput !== 'text';
+
+    const params: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
+      model,
+      messages,
+      temperature: request.temperature ?? 0.7,
+      max_tokens: request.maxTokens ?? 2500,
+    };
+
+    if (isJsonExpected) {
+      params.response_format = { type: 'json_object' };
+    }
+
+    const completion = await groq.chat.completions.create(params);
+    const choice = completion.choices[0];
+    const text = choice?.message?.content || '';
+
+    const usage = completion.usage
+      ? {
+          promptTokens: completion.usage.prompt_tokens,
+          completionTokens: completion.usage.completion_tokens,
+          totalTokens: completion.usage.total_tokens,
+        }
+      : undefined;
+
+    return {
+      text: text.trim(),
+      model: completion.model || model,
+      usage,
+    };
+  }
+}
